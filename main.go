@@ -16,13 +16,12 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
+	"sort"
 	"strings"
-
-	"fmt"
-	"io"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/protoc-gen-go/descriptor"
@@ -56,6 +55,24 @@ func init() {
 	enumMap = make(map[string]*Enum)
 }
 
+type typeEntry struct {
+	name   string
+	output string
+}
+
+// shouldEmitFile returns true if types from this proto file should be included
+// in the output. We exclude google/protobuf/* files (descriptor types that vary
+// by protoc version) except wrappers.proto which application fields reference.
+func shouldEmitFile(filename string) bool {
+	if filename == "google/protobuf/wrappers.proto" {
+		return true
+	}
+	if strings.HasPrefix(filename, "google/protobuf/") {
+		return false
+	}
+	return true
+}
+
 func main() {
 	data, err := ioutil.ReadAll(os.Stdin)
 	if err != nil {
@@ -67,22 +84,46 @@ func main() {
 		log.Fatalf("unable to parse protobuf: %v", err)
 	}
 
-	code := bytes.NewBuffer(nil)
-	code.WriteString(typescriptFileHeader)
-
+	// Phase 1: Register all types from all files into messageMap/enumMap
+	// so that type references (e.g. google.protobuf.BoolValue) resolve correctly.
 	for _, f := range req.ProtoFile {
 		ns := strings.Replace(*f.Package, ".", "$", -1) + "$"
 		for _, enum := range f.EnumType {
-			emitEnumType(code, ns, enum)
+			registerEnumType(ns, enum)
 		}
-
 		for _, msg := range f.MessageType {
-			emitMessageType(code, ns, msg)
+			registerMessageType(ns, msg)
 		}
+	}
 
-		for _, svc := range f.Service {
-			emitServiceType(code, ns, svc)
+	// Phase 2: Collect type entries only from non-excluded files.
+	var entries []typeEntry
+	for _, f := range req.ProtoFile {
+		if !shouldEmitFile(f.GetName()) {
+			continue
 		}
+		ns := strings.Replace(*f.Package, ".", "$", -1) + "$"
+		for _, enum := range f.EnumType {
+			entries = append(entries, collectEnumEntries(ns, enum)...)
+		}
+		for _, msg := range f.MessageType {
+			entries = append(entries, collectMessageEntries(ns, msg)...)
+		}
+		for _, svc := range f.Service {
+			entries = append(entries, collectServiceEntries(ns, svc)...)
+		}
+	}
+
+	// Sort all entries alphabetically by type name for deterministic output.
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].name < entries[j].name
+	})
+
+	// Write header + sorted entries.
+	code := bytes.NewBuffer(nil)
+	code.WriteString(typescriptFileHeader)
+	for _, e := range entries {
+		code.WriteString(e.output)
 	}
 
 	const outputFilename = "index.ts"
@@ -95,73 +136,83 @@ func main() {
 	})
 }
 
-func emitEnumType(code io.Writer, namespace string, enum *descriptor.EnumDescriptorProto) error {
-	name := namespace + *enum.Name
+// Phase 1: Register types into maps without generating output.
 
+func registerEnumType(namespace string, enum *descriptor.EnumDescriptorProto) {
+	name := namespace + *enum.Name
 	e := &Enum{
 		Name:   name,
 		Values: []string{},
 	}
-
 	for _, v := range enum.Value {
-		// Skip default value since we represent it with 'undefined' in JS
 		if *v.Number == 0 {
 			continue
 		}
-
 		e.Values = append(e.Values, *v.Name)
 	}
-
-	enumTemplate.Execute(code, e)
-
 	enumMap[name] = e
-
-	return nil
 }
 
-func emitMessageType(code io.Writer, namespace string, msg *descriptor.DescriptorProto) error {
+func registerMessageType(namespace string, msg *descriptor.DescriptorProto) {
 	name := namespace + *msg.Name
-
 	m := &Message{
 		Name:   name,
 		Fields: []*Field{},
 		IsMap:  msg.GetOptions().GetMapEntry(),
 	}
-
 	nestedNS := name + "$"
 	for _, enum := range msg.EnumType {
-		emitEnumType(code, nestedNS, enum)
+		registerEnumType(nestedNS, enum)
 	}
-
 	for _, nestedType := range msg.NestedType {
-		emitMessageType(code, nestedNS, nestedType)
+		registerMessageType(nestedNS, nestedType)
 	}
-
 	for _, field := range msg.Field {
 		m.Fields = append(m.Fields, &Field{
 			Name: *field.Name,
 			Type: getFieldType(name, field),
 		})
 	}
-
-	// Map types are inlined
-	if !m.IsMap {
-		messageTemplate.Execute(code, m)
-	}
-
 	messageMap[name] = m
-
-	return nil
 }
 
-func emitServiceType(code io.Writer, namespace string, svc *descriptor.ServiceDescriptorProto) error {
-	name := namespace + *svc.Name
+// Phase 2: Collect rendered type entries for non-excluded files.
 
+func collectEnumEntries(namespace string, enum *descriptor.EnumDescriptorProto) []typeEntry {
+	name := namespace + *enum.Name
+	e := enumMap[name]
+	var buf bytes.Buffer
+	enumTemplate.Execute(&buf, e)
+	return []typeEntry{{name: name, output: buf.String()}}
+}
+
+func collectMessageEntries(namespace string, msg *descriptor.DescriptorProto) []typeEntry {
+	name := namespace + *msg.Name
+	m := messageMap[name]
+
+	var entries []typeEntry
+	nestedNS := name + "$"
+	for _, enum := range msg.EnumType {
+		entries = append(entries, collectEnumEntries(nestedNS, enum)...)
+	}
+	for _, nestedType := range msg.NestedType {
+		entries = append(entries, collectMessageEntries(nestedNS, nestedType)...)
+	}
+	// Map types are inlined, don't emit a separate type
+	if !m.IsMap {
+		var buf bytes.Buffer
+		messageTemplate.Execute(&buf, m)
+		entries = append(entries, typeEntry{name: name, output: buf.String()})
+	}
+	return entries
+}
+
+func collectServiceEntries(namespace string, svc *descriptor.ServiceDescriptorProto) []typeEntry {
+	name := namespace + *svc.Name
 	s := &Service{
 		Name:    name,
 		Methods: []*Method{},
 	}
-
 	for _, method := range svc.Method {
 		s.Methods = append(s.Methods, &Method{
 			Name:         *method.Name,
@@ -169,9 +220,9 @@ func emitServiceType(code io.Writer, namespace string, svc *descriptor.ServiceDe
 			ResponseType: getScopedName(*method.OutputType),
 		})
 	}
-
-	serviceTemplate.Execute(code, s)
-	return nil
+	var buf bytes.Buffer
+	serviceTemplate.Execute(&buf, s)
+	return []typeEntry{{name: name, output: buf.String()}}
 }
 
 func emitFiles(out []*plugin.CodeGeneratorResponse_File) {
